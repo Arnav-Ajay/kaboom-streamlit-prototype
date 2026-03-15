@@ -1,1 +1,1 @@
-from .ui import views
+"""Kaboom Streamlit app package."""

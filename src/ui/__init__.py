@@ -1,1 +1,1 @@
-from .views import landing_page, lobby_page, game_page
+"""UI package for the Streamlit app."""
