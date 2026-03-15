@@ -1,8 +1,27 @@
-# Kaboom Streamlit App
+# Kaboom Streamlit Prototype
+
+⚠️ **This repository is a development prototype used while building the Kaboom engine.**
 
 Streamlit application for Kaboom built on top of `kaboom-engine`.
 
 This repository should now be treated as a fresh UI project, not as an authoritative implementation of Kaboom rules. The rules engine lives in `kaboom-core` and must remain the single source of truth for game setup, legality, state transitions, scoring, reactions, powers, and endgame behavior.
+
+Authoritative engine repo:
+- https://github.com/Arnav-Ajay/kaboom-core
+
+Live prototype deployment:
+- https://kaboom.streamlit.app/
+
+## Purpose
+
+This prototype UI is used during development of the Kaboom engine to:
+- manually play through engine flows
+- validate legal actions returned by the engine
+- test reaction windows and pending powers
+- inspect per-player memory views
+- record event logs for debugging
+
+It is not intended to be the final production UI and may diverge from the eventual multiplayer interface.
 
 ## Status
 
@@ -18,6 +37,16 @@ Current implemented scope:
 - opening peek flow
 - turn, reaction, and pending-power action execution from `get_valid_actions(state)`
 - event log and raw engine snapshot for debugging
+
+## Local Gameplay
+
+The prototype currently supports:
+- single-browser play
+- human vs simple agent mode
+- action execution through the engine API
+- event-log persistence for debugging
+
+The built-in agent is intentionally simple and exists primarily to exercise engine logic.
 
 ## Project Direction
 
@@ -48,6 +77,17 @@ This repository should own:
 - action submission to the engine
 - persistence and multiplayer transport
 - event logs, replay views, and operator/debug views
+
+## Kaboom Project Structure
+
+`kaboom-core`
+- deterministic game engine and rule implementation
+
+`kaboom-cli`
+- command-line interface used for engine testing and debugging
+
+`kaboom-streamlit-prototype`
+- Streamlit-based inspection tool used during engine development
 
 ## Legacy Prototype Assessment
 
