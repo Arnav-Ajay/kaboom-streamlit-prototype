@@ -65,6 +65,8 @@ Exit criteria:
 Current status:
 - implemented
 - presenter helpers have basic pytest coverage
+- first-pass local human-vs-agent mode is implemented for 2-player tables
+- JSON event logs are persisted locally for each session
 - Streamlit runtime still needs manual browser verification in an environment with `streamlit` installed
 
 ### Milestone 2: Perspective-Safe Rendering
@@ -81,6 +83,23 @@ Deliverables:
 Exit criteria:
 - the same underlying game can be viewed safely from different player perspectives
 - hidden information is controlled by UI rendering rules, not alternate game logic
+
+### Milestone 2A: Local Agent Iteration
+
+Goal:
+Make the local agent opponent good enough to support realistic single-browser playtesting.
+
+Deliverables:
+- seat control between human and agent
+- deterministic heuristic policy using only engine legal actions and player memory
+- auto-step loop for agent-controlled opening peek, turns, and pending power resolution
+- event log entries that explain agent choices
+- reaction-window coordination that pauses correctly for the human side
+
+Exit criteria:
+- a human can play against one local agent without taking the other side manually
+- the agent does not bypass hidden-information rules
+- the app stops auto-play whenever human input is required
 
 ### Milestone 3: Room and Lobby Layer
 

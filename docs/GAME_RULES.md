@@ -132,7 +132,7 @@ If you throw the wrong card:
 - you draw 1 penalty card face down into your hand
 - the reaction window stays open
 
-Each player is limited to 1 wrong reaction attempt per discard event.
+Each player is limited to 1 wrong reaction attempt per discard event by default.
 
 ### Priority
 

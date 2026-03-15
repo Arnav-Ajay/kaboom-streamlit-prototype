@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from dataclasses import fields, is_dataclass
 from typing import Iterable
 
@@ -53,7 +54,7 @@ def describe_action(players: list[Player], action) -> str:
     if isinstance(action, CloseReaction):
         return f"{actor}: close reaction window"
     if isinstance(action, ResolvePendingPower):
-        return f"{actor}: resolve pending power"
+        return f"{actor}: resolve pending power now (reveal/apply, reaction stays open)"
     if isinstance(action, ReactDiscardOwnCard):
         return (
             f"{actor}: attempt discard own card at index {action.card_index} "
@@ -79,12 +80,20 @@ def format_result(result: object) -> str:
     else:
         items = result.__dict__.items()
     for field_name, value in items:
+        if field_name == "penalty_card":
+            continue
         if value is None or value is False:
             continue
         if isinstance(value, Card):
             value = format_card(value)
         fragments.append(f"{field_name}={value}")
     return " | ".join(fragments) if fragments else repr(result)
+
+
+def action_key(action: object, prefix: str = "action") -> str:
+    payload = repr(action).encode("utf-8", errors="ignore")
+    digest = hashlib.md5(payload, usedforsecurity=False).hexdigest()[:12]
+    return f"{prefix}_{digest}"
 
 
 def format_memory_entries(entries: Iterable[tuple[tuple[int, int], Card]]) -> str:

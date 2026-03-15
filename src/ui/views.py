@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
+from datetime import datetime
 from typing import Iterable
 
 import streamlit as st
@@ -20,10 +22,14 @@ from kaboom import (
     apply_action,
     get_valid_actions,
 )
+from kaboom.exceptions import InvalidActionError
 from kaboom.players.player import Player
 from kaboom.powers.types import PowerType
 
+from src.agent import choose_agent_decision
+
 from .presenter import (
+    action_key,
     describe_action,
     format_card,
     format_memory_entries,
@@ -40,6 +46,7 @@ DEFAULT_HAND_SIZE = 4
 DEFAULT_EVENT_LOG_LIMIT = 24
 PLAYER_COLUMNS = 3
 RULES_PATH = Path(__file__).resolve().parents[2] / "docs" / "GAME_RULES.md"
+EVENT_LOG_DIR = Path(__file__).resolve().parents[2] / "backend" / "event_logs"
 
 
 def ensure_app_state() -> None:
@@ -49,6 +56,15 @@ def ensure_app_state() -> None:
     st.session_state.setdefault("show_full_state", False)
     st.session_state.setdefault("event_log", [])
     st.session_state.setdefault("power_reveal", [])
+    st.session_state.setdefault("player_control", {})
+    st.session_state.setdefault("agent_mode", True)
+    st.session_state.setdefault("human_player_id", 0)
+    st.session_state.setdefault("reaction_passes", {})
+    st.session_state.setdefault("reaction_window_key", None)
+    st.session_state.setdefault("event_log_path", None)
+    st.session_state.setdefault("queued_resolve_pending_power_actor_id", None)
+    st.session_state.setdefault("previous_window_signature", None)
+    st.session_state.setdefault("window_notice", None)
 
 
 def landing_page() -> None:
@@ -73,32 +89,70 @@ def landing_page() -> None:
     with controls[0]:
         _render_rules_button("View Rules")
 
+    agent_mode = st.toggle("Play against local agent", value=st.session_state.agent_mode)
+    st.session_state.agent_mode = agent_mode
+
     top_cols = st.columns([1, 1], gap="large")
     with top_cols[0]:
-        num_players = st.slider("Players", min_value=2, max_value=MAX_PLAYERS, value=DEFAULT_PLAYERS)
+        if agent_mode:
+            num_players = 2
+            st.number_input("Players", min_value=2, max_value=2, value=2, disabled=True)
+        else:
+            num_players = st.slider("Players", min_value=2, max_value=MAX_PLAYERS, value=DEFAULT_PLAYERS)
     with top_cols[1]:
         hand_size = st.slider("Hand size", min_value=2, max_value=6, value=DEFAULT_HAND_SIZE)
 
+    human_seat = 0
+    if agent_mode:
+        human_seat = st.radio(
+            "Human seat",
+            options=[0, 1],
+            format_func=lambda seat: f"Seat {seat + 1}",
+            horizontal=True,
+        )
+
     with st.form("new_game_form"):
         st.markdown("### Table Setup")
-        player_names = [
-            st.text_input(f"Player {index + 1}", value=f"P{index + 1}", key=f"landing_player_{index}")
-            for index in range(num_players)
-        ]
+        player_names = []
+        for index in range(num_players):
+            default_name = f"Player {index}"
+            if agent_mode and index != human_seat:
+                default_name = "Agent"
+            player_names.append(
+                st.text_input(
+                    f"Player {index + 1}",
+                    value=default_name,
+                    key=f"landing_player_{index}",
+                    disabled=agent_mode and index != human_seat,
+                )
+            )
         submitted = st.form_submit_button("Start Local Inspector")
 
     if submitted:
         engine = GameEngine(game_id=0, num_players=num_players, hand_size=hand_size)
         for index, player in enumerate(engine.state.players):
-            player.name = player_names[index].strip() or f"P{index + 1}"
+            player.name = player_names[index].strip() or f"Player {index}"
+
+        player_control = {player.id: "human" for player in engine.state.players}
+        if agent_mode:
+            for player in engine.state.players:
+                player_control[player.id] = "human" if player.id == human_seat else "agent"
 
         st.session_state.engine = engine
-        st.session_state.selected_viewer_id = engine.state.players[0].id
+        st.session_state.player_control = player_control
+        st.session_state.human_player_id = human_seat
+        st.session_state.selected_viewer_id = human_seat if agent_mode else engine.state.players[0].id
         st.session_state.show_full_state = False
         st.session_state.power_reveal = []
-        st.session_state.event_log = [
-            f"Started local inspector with {num_players} players and hand size {hand_size}."
-        ]
+        _set_event_log_path(engine)
+        st.session_state.event_log = []
+        _append_event_log(
+            (
+                f"Started local inspector with {num_players} players and hand size {hand_size}."
+                if not agent_mode
+                else f"Started human vs agent inspector with human seat {human_seat + 1} and hand size {hand_size}."
+            )
+        )
         st.session_state.page = "game"
         st.rerun()
 
@@ -112,6 +166,11 @@ def game_page() -> None:
         st.session_state.page = "landing"
         st.rerun()
         return
+
+    _sync_reaction_pass_state(engine)
+    _process_queued_actions(engine)
+    current_signature = _state_window_signature(engine)
+    _update_window_notice(engine, current_signature)
 
     st.markdown(
         """
@@ -140,8 +199,12 @@ def game_page() -> None:
         _render_actions(engine)
 
     with col_right:
+        _render_power_reveal_panel()
         _render_memory_panels(engine)
         _render_event_log()
+
+    st.session_state.previous_window_signature = current_signature
+    _auto_step_agents(engine)
 
 
 def _render_sidebar(engine: GameEngine) -> None:
@@ -165,12 +228,24 @@ def _render_sidebar(engine: GameEngine) -> None:
         st.markdown("---")
         st.caption("This inspector executes one engine action at a time.")
         st.caption("During contested discard windows, the first applied action wins priority.")
-        _render_rules_button("Rules")
+        if st.session_state.agent_mode:
+            st.caption("Agent seats auto-play until a human decision is required.")
+            st.caption(
+                f"Human controls: {player_name(state.players, st.session_state.human_player_id)} "
+                f"| Viewing: {player_name(state.players, st.session_state.selected_viewer_id)}"
+            )
 
         if st.button("Reset To Landing"):
             st.session_state.engine = None
             st.session_state.event_log = []
             st.session_state.power_reveal = []
+            st.session_state.player_control = {}
+            st.session_state.agent_mode = True
+            st.session_state.human_player_id = 0
+            st.session_state.reaction_passes = {}
+            st.session_state.reaction_window_key = None
+            st.session_state.event_log_path = None
+            st.session_state.queued_resolve_pending_power_actor_id = None
             st.session_state.page = "landing"
             st.rerun()
 
@@ -206,10 +281,13 @@ def _render_game_summary(engine: GameEngine) -> None:
             f"Reaction open for rank `{state.reaction_rank}`. "
             "Correct claims succeed. Wrong claims reveal the card to everyone and add a penalty card."
         )
+    pending_hint = _format_pending_power_hint(engine)
+    if pending_hint:
+        st.warning(pending_hint)
     if state.kaboom_called_by is not None:
         st.warning(f"Kaboom called by {player_name(state.players, state.kaboom_called_by)}.")
     if st.session_state.power_reveal:
-        st.success("Power reveal: " + " | ".join(st.session_state.power_reveal))
+        st.info("A private reveal was recorded and can be used immediately in this same discard window.")
     if state.phase == GamePhase.GAME_OVER:
         st.success(f"Winner: {engine.get_winner()} | Scores: {engine.get_scores()}")
 
@@ -265,11 +343,32 @@ def _render_memory_panels(engine: GameEngine) -> None:
 
 def _render_actions(engine: GameEngine) -> None:
     state = engine.state
-    actions = get_valid_actions(state)
+    actions = _app_visible_actions(engine, get_valid_actions(state))
+    if st.session_state.agent_mode:
+        actions = [
+            action
+            for action in actions
+            if _control_for_actor(_action_actor_id(engine, action)) == "human"
+        ]
 
     st.subheader("Legal Actions")
+    _render_window_notice()
     if not actions:
-        st.info("No legal actions available.")
+        if st.session_state.agent_mode and engine.state.phase == GamePhase.REACTION:
+            st.caption("Every action below comes from `get_valid_actions(state)`.")
+            _render_phase_help(state.phase)
+            with st.container(border=True):
+                _render_pass_panel(engine)
+                if _reaction_actor_passed(st.session_state.human_player_id):
+                    st.info("Waiting for agent action.")
+                else:
+                    st.info("You can pass on this discard event or make a visible legal reaction if one appears.")
+            return
+
+        if st.session_state.agent_mode and engine.state.phase != GamePhase.GAME_OVER:
+            st.info("Waiting for agent action.")
+        else:
+            st.info("No legal actions available.")
         return
 
     st.caption("Every action below comes from `get_valid_actions(state)`.")
@@ -279,7 +378,19 @@ def _render_actions(engine: GameEngine) -> None:
         if state.phase == GamePhase.OPENING_PEEK:
             _render_opening_peek_panel(engine)
             return
+
+        if state.pending_power_action is not None:
+            _render_pending_power_panel(engine, actions)
+
+        if state.phase == GamePhase.REACTION:
+            _render_reaction_status(engine)
+            _render_pass_panel(engine)
+
         for index, action in enumerate(actions):
+            if isinstance(action, ResolvePendingPower):
+                continue
+            if isinstance(action, CloseReaction):
+                continue
             if isinstance(action, UsePower):
                 _render_use_power_action(engine, action, index)
                 continue
@@ -292,15 +403,76 @@ def _render_phase_help(phase: GamePhase) -> None:
     elif phase == GamePhase.TURN_RESOLVE:
         st.caption("Turn resolve: discard, replace, or discard for power.")
     elif phase == GamePhase.REACTION:
-        st.caption("Reaction window: first applied action wins the contested discard event.")
+        st.caption(
+            "Reaction window: first applied action wins the contested discard event. "
+            "Informational powers reveal immediately when resolved, and the same window stays open."
+        )
 
 
 def _render_direct_action(engine: GameEngine, action, index: int) -> None:
     label = describe_action(engine.state.players, action)
-    if st.button(label, key=f"action_button_{index}", use_container_width=True):
-        results = _execute_action(engine, action)
-        _record_results(results)
+    if st.button(label, key=action_key(action, "action_button"), use_container_width=True):
+        try:
+            results = _execute_action(engine, action)
+            _record_results(results)
+        except InvalidActionError as exc:
+            st.error(str(exc))
         st.rerun()
+
+
+def _render_pending_power_panel(engine: GameEngine, actions) -> None:
+    pending = engine.state.pending_power_action
+    if pending is None:
+        return
+
+    resolve_action = next((action for action in actions if isinstance(action, ResolvePendingPower)), None)
+    st.markdown("### Pending Power")
+    st.warning(
+        "This discard event has a claimed power. Resolve it now to reveal/apply the power while keeping the same "
+        "reaction window open."
+    )
+    st.markdown(f"`{_describe_pending_resolution(engine)}`")
+    if resolve_action is not None:
+        if st.button("Resolve Pending Power Now", key="resolve_pending_power_button", use_container_width=True):
+            st.session_state.queued_resolve_pending_power_actor_id = resolve_action.actor_id
+            st.rerun()
+
+
+def _render_pass_panel(engine: GameEngine) -> None:
+    if not st.session_state.agent_mode:
+        return
+
+    actor_id = st.session_state.human_player_id
+    if _control_for_actor(actor_id) != "human":
+        return
+
+    if _reaction_actor_passed(actor_id):
+        st.caption("You have already passed for this discard event.")
+        return
+
+    if st.button("Pass Reaction", key="pass_reaction_button", use_container_width=True):
+        _mark_reaction_pass(actor_id, engine)
+        actions = _app_visible_actions(engine, get_valid_actions(engine.state))
+        if _can_finalize_reaction_window(actions):
+            _finalize_reaction_window(engine)
+        st.rerun()
+
+
+def _render_reaction_status(engine: GameEngine) -> None:
+    if not st.session_state.agent_mode:
+        return
+
+    st.markdown("### Reaction Status")
+    cols = st.columns(len(engine.state.players))
+    for col, player in zip(cols, engine.state.players):
+        with col:
+            if _reaction_actor_passed(player.id):
+                status = "passed"
+            elif _player_can_still_react(engine, player.id):
+                status = "waiting"
+            else:
+                status = "done"
+            st.caption(f"{player_label(player)}: {status}")
 
 
 def _render_opening_peek_panel(engine: GameEngine) -> None:
@@ -321,40 +493,53 @@ def _render_opening_peek_panel(engine: GameEngine) -> None:
         submitted = st.form_submit_button(f"Apply opening peek for {player.name}")
 
     if submitted:
-        results = engine.perform_opening_peek(player.id, tuple(chosen))
-        _record_results(results)
+        try:
+            results = engine.perform_opening_peek(player.id, tuple(chosen))
+            _record_results(results)
+        except InvalidActionError as exc:
+            st.error(str(exc))
         st.rerun()
 
 
 def _render_use_power_action(engine: GameEngine, action: UsePower, index: int) -> None:
     state = engine.state
     actor = state.resolve_player(action.actor_id)
+    other_players = [player for player in state.players if player.id != actor.id and player.active and len(player.hand) > 0]
+    can_submit = True
+    key_base = action_key(action, "use_power")
 
-    with st.form(f"use_power_form_{index}"):
+    with st.form(f"{key_base}_form"):
         st.markdown(f"**{player_label(actor)} use power: `{action.power_name.value}`**")
         st.caption(
             f"Source card: {format_card(action.source_card)}. "
             "The card is discarded first; power and reaction then compete for priority."
         )
-        payload = _build_power_payload_inputs(state, action, index)
-        submitted = st.form_submit_button(f"Discard for power: {action.power_name.value}")
+        payload, can_submit = _build_power_payload_inputs(state, action, key_base, other_players)
+        submitted = st.form_submit_button(f"Discard for power: {action.power_name.value}", disabled=not can_submit)
 
     if submitted:
-        results = engine.use_power(
-            power_name=action.power_name,
-            player=actor.id,
-            target_player_id=payload["target_player_id"],
-            target_card_index=payload["target_card_index"],
-            second_target_player_id=payload["second_target_player_id"],
-            second_target_card_index=payload["second_target_card_index"],
-        )
-        _record_results(results)
+        try:
+            results = engine.use_power(
+                power_name=action.power_name,
+                player=actor.id,
+                target_player_id=payload["target_player_id"],
+                target_card_index=payload["target_card_index"],
+                second_target_player_id=payload["second_target_player_id"],
+                second_target_card_index=payload["second_target_card_index"],
+            )
+            _record_results(results)
+        except InvalidActionError as exc:
+            st.error(str(exc))
         st.rerun()
 
 
-def _build_power_payload_inputs(state, action: UsePower, index: int) -> dict[str, int | None]:
+def _build_power_payload_inputs(
+    state,
+    action: UsePower,
+    key_base: str,
+    other_players,
+) -> tuple[dict[str, int | None], bool]:
     actor = state.resolve_player(action.actor_id)
-    other_players = [player for player in state.players if player.id != actor.id and player.active]
     other_player_ids = [player.id for player in other_players]
 
     payload = {
@@ -368,49 +553,55 @@ def _build_power_payload_inputs(state, action: UsePower, index: int) -> dict[str
         payload["target_card_index"] = st.selectbox(
             "Your card index",
             options=list(range(len(actor.hand))),
-            key=f"power_self_index_{index}",
+            key=f"{key_base}_self_index",
         )
-        return payload
+        return payload, True
 
     if action.power_name == PowerType.SEE_OTHER:
+        if not other_player_ids:
+            st.info("No valid other player cards are available for this power.")
+            return payload, False
         target_player_id = st.selectbox(
             "Target player",
             options=other_player_ids,
             format_func=lambda player_id: player_name(state.players, player_id),
-            key=f"power_other_player_{index}",
+            key=f"{key_base}_other_player",
         )
         target_player = state.resolve_player(target_player_id)
         payload["target_player_id"] = target_player.id
         payload["target_card_index"] = st.selectbox(
             "Target card index",
             options=list(range(len(target_player.hand))),
-            key=f"power_other_index_{index}",
+            key=f"{key_base}_other_index",
         )
-        return payload
+        return payload, True
 
     if action.power_name in {PowerType.BLIND_SWAP, PowerType.SEE_AND_SWAP}:
+        if not other_player_ids:
+            st.info("No valid other player cards are available for this power.")
+            return payload, False
         payload["target_player_id"] = actor.id
         payload["target_card_index"] = st.selectbox(
             "Your card index",
             options=list(range(len(actor.hand))),
-            key=f"power_swap_own_index_{index}",
+            key=f"{key_base}_swap_own_index",
         )
         second_player_id = st.selectbox(
             "Other player",
             options=other_player_ids,
             format_func=lambda player_id: player_name(state.players, player_id),
-            key=f"power_swap_other_player_{index}",
+            key=f"{key_base}_swap_other_player",
         )
         second_player = state.resolve_player(second_player_id)
         payload["second_target_player_id"] = second_player.id
         payload["second_target_card_index"] = st.selectbox(
             "Other player card index",
             options=list(range(len(second_player.hand))),
-            key=f"power_swap_other_index_{index}",
+            key=f"{key_base}_swap_other_index",
         )
-        return payload
+        return payload, True
 
-    return payload
+    return payload, True
 
 
 def _execute_action(engine: GameEngine, action):
@@ -430,6 +621,8 @@ def _execute_action(engine: GameEngine, action):
         reveal_snapshot = _snapshot_pending_power_reveal(engine, pending)
         results = engine.resolve_pending_power(action.actor_id)
         st.session_state.power_reveal = _format_power_reveal(engine, pending, reveal_snapshot)
+        for reveal in st.session_state.power_reveal:
+            _append_event_log(f"reveal={reveal['public']}")
         return results
     if isinstance(action, ReactDiscardOwnCard):
         return [engine.react_discard_own_card(action.actor_id, action.card_index)]
@@ -445,16 +638,400 @@ def _execute_action(engine: GameEngine, action):
     return apply_action(engine.state, action)
 
 
+def _execute_agent_decision(engine: GameEngine, decision) -> None:
+    st.session_state.power_reveal = []
+    actor_id = _decision_actor_id(decision.action)
+    actor_name = player_name(engine.state.players, actor_id) if actor_id is not None else "Agent"
+    _append_event_log(f"agent={actor_name} | decision={decision.note}")
+
+    if isinstance(decision.action, tuple) and decision.action[0] == "opening_peek":
+        _, player_id, indices = decision.action
+        results = engine.perform_opening_peek(player_id, indices)
+        _record_results(results)
+        return
+
+    if isinstance(decision.action, UsePower):
+        payload = decision.payload or {}
+        results = engine.use_power(
+            power_name=decision.action.power_name,
+            player=decision.action.actor_id,
+            target_player_id=payload.get("target_player_id"),
+            target_card_index=payload.get("target_card_index"),
+            second_target_player_id=payload.get("second_target_player_id"),
+            second_target_card_index=payload.get("second_target_card_index"),
+        )
+        _record_results(results)
+        return
+
+    results = _execute_action(engine, decision.action)
+    _record_results(results)
+
+
+def _auto_step_agents(engine: GameEngine) -> None:
+    steps_taken = False
+    for _ in range(32):
+        if engine.state.phase == GamePhase.GAME_OVER:
+            break
+
+        actions = _app_visible_actions(engine, get_valid_actions(engine.state))
+        if not actions:
+            break
+
+        if engine.state.phase == GamePhase.REACTION and _can_finalize_reaction_window(actions):
+            _finalize_reaction_window(engine)
+            steps_taken = True
+            continue
+
+        if engine.state.phase == GamePhase.REACTION:
+            agent_actor_id = _next_agent_actor_id(engine, actions)
+            if agent_actor_id is not None:
+                decision = choose_agent_decision(engine, agent_actor_id)
+                if decision is None:
+                    _mark_reaction_pass(agent_actor_id, engine)
+                    steps_taken = True
+                    continue
+
+                _execute_agent_decision(engine, decision)
+                steps_taken = True
+                continue
+
+        if _has_human_input_available(engine, actions):
+            break
+
+        agent_actor_id = _next_agent_actor_id(engine, actions)
+        if agent_actor_id is None:
+            break
+
+        decision = choose_agent_decision(engine, agent_actor_id)
+        if decision is None:
+            _mark_reaction_pass(agent_actor_id, engine)
+            steps_taken = True
+            continue
+
+        _execute_agent_decision(engine, decision)
+        steps_taken = True
+
+    if steps_taken:
+        st.rerun()
+
+
+def _has_human_input_available(engine: GameEngine, actions) -> bool:
+    if not st.session_state.agent_mode:
+        return True
+    if engine.state.phase == GamePhase.REACTION:
+        human_id = st.session_state.human_player_id
+        human = engine.state.resolve_player(human_id)
+        if human.active and not _reaction_actor_passed(human_id):
+            return True
+    return any(
+        not isinstance(action, CloseReaction) and _control_for_actor(_action_actor_id(engine, action)) == "human"
+        for action in actions
+    )
+
+
+def _next_agent_actor_id(engine: GameEngine, actions) -> int | None:
+    for action in actions:
+        actor_id = _action_actor_id(engine, action)
+        if actor_id is not None and _control_for_actor(actor_id) == "agent":
+            return actor_id
+    return None
+
+
+def _action_actor_id(engine: GameEngine, action) -> int | None:
+    if isinstance(action, ResolvePendingPower):
+        return action.actor_id
+    if hasattr(action, "actor_id"):
+        return action.actor_id
+    return None
+
+
+def _decision_actor_id(action) -> int | None:
+    if isinstance(action, tuple):
+        return action[1]
+    return getattr(action, "actor_id", None)
+
+
+def _control_for_actor(actor_id: int | None) -> str:
+    if actor_id is None:
+        return "human"
+    return st.session_state.player_control.get(actor_id, "human")
+
+
+def _current_reaction_window_key(engine: GameEngine):
+    state = engine.state
+    if state.phase != GamePhase.REACTION or not state.reaction_open:
+        return None
+    top = state.top_discard()
+    top_label = format_card(top)
+    pending = state.pending_power_action
+    pending_signature = None
+    if pending is not None:
+        pending_signature = (
+            pending.actor_id,
+            pending.power_name.value,
+            pending.target_player_id,
+            pending.target_card_index,
+            pending.second_target_player_id,
+            pending.second_target_card_index,
+        )
+    return (
+        state.round_number,
+        len(state.discard_pile),
+        state.reaction_rank,
+        state.reaction_initiator,
+        top_label,
+        pending_signature,
+    )
+
+
+def _sync_reaction_pass_state(engine: GameEngine) -> None:
+    window_key = _current_reaction_window_key(engine)
+    if window_key is None:
+        st.session_state.reaction_window_key = None
+        st.session_state.reaction_passes = {}
+        return
+    if st.session_state.reaction_window_key != window_key:
+        st.session_state.reaction_window_key = window_key
+        st.session_state.reaction_passes = {}
+
+
+def _reaction_actor_passed(actor_id: int) -> bool:
+    return st.session_state.reaction_passes.get(actor_id, False)
+
+
+def _mark_reaction_pass(actor_id: int, engine: GameEngine) -> None:
+    st.session_state.reaction_passes[actor_id] = True
+    actor_name = player_name(engine.state.players, actor_id)
+    _append_event_log(f"pass={actor_name} passed on this discard event")
+
+
+def _app_visible_actions(engine: GameEngine, actions):
+    if engine.state.phase != GamePhase.REACTION:
+        return actions
+
+    filtered = []
+    for action in actions:
+        if isinstance(action, CloseReaction):
+            filtered.append(action)
+            continue
+        actor_id = _action_actor_id(engine, action)
+        if actor_id is not None and _reaction_actor_passed(actor_id):
+            continue
+        filtered.append(action)
+    return filtered
+
+
+def _can_finalize_reaction_window(actions) -> bool:
+    if not actions:
+        return False
+    return all(isinstance(action, CloseReaction) for action in actions)
+
+
+def _finalize_reaction_window(engine: GameEngine) -> None:
+    results = engine.close_reaction()
+    _record_results(results)
+
+
+def _player_can_still_react(engine: GameEngine, player_id: int) -> bool:
+    actions = _app_visible_actions(engine, get_valid_actions(engine.state))
+    return any(
+        not isinstance(action, CloseReaction) and _action_actor_id(engine, action) == player_id
+        for action in actions
+    )
+
+
 def _record_results(results: Iterable[object]) -> None:
     for result in results:
-        st.session_state.event_log.append(format_result(result))
+        _append_event_log(format_result(result))
+
+
+def _state_window_signature(engine: GameEngine):
+    state = engine.state
+    return (
+        state.round_number,
+        state.phase.value,
+        state.current_player().id if state.phase != GamePhase.GAME_OVER else None,
+        state.reaction_open,
+        state.reaction_rank,
+        format_card(state.top_discard()),
+        format_card(state.drawn_card),
+    )
+
+
+def _update_window_notice(engine: GameEngine, current_signature) -> None:
+    previous = st.session_state.previous_window_signature
+    if previous is None or previous == current_signature:
+        return
+
+    state = engine.state
+    current_player = player_name(state.players, state.current_player().id) if state.phase != GamePhase.GAME_OVER else "none"
+    previous_round, previous_phase, previous_player_id, *_ = previous
+    previous_player = (
+        player_name(state.players, previous_player_id)
+        if previous_player_id is not None
+        else "none"
+    )
+
+    if previous_phase != state.phase.value or previous_player_id != state.current_player().id or previous_round != state.round_number:
+        st.session_state.window_notice = (
+            f"State updated: now Round {state.round_number}, Phase {state.phase.value}, Current {current_player}. "
+            f"Previously you were viewing Round {previous_round}, Phase {previous_phase}, Current {previous_player}."
+        )
+    else:
+        st.session_state.window_notice = "State updated."
+
+
+def _render_window_notice() -> None:
+    notice = st.session_state.window_notice
+    if notice:
+        st.warning(notice)
+
+
+def _set_event_log_path(engine: GameEngine) -> None:
+    EVENT_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    st.session_state.event_log_path = EVENT_LOG_DIR / f"game_{engine.game_id}_{timestamp}.json"
+    _write_event_log_file()
+
+
+def _append_event_log(entry: str) -> None:
+    st.session_state.event_log.append(entry)
     st.session_state.event_log = st.session_state.event_log[-DEFAULT_EVENT_LOG_LIMIT:]
+    _write_event_log_file()
+
+
+def _write_event_log_file() -> None:
+    path = st.session_state.event_log_path
+    if path is None:
+        return
+    payload = {
+        "generated_at": datetime.now().isoformat(),
+        "entries": st.session_state.event_log,
+    }
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def _process_queued_actions(engine: GameEngine) -> None:
+    actor_id = st.session_state.queued_resolve_pending_power_actor_id
+    if actor_id is None:
+        return
+    st.session_state.queued_resolve_pending_power_actor_id = None
+    try:
+        results = _execute_action(engine, ResolvePendingPower(actor_id=actor_id))
+        _record_results(results)
+    except InvalidActionError as exc:
+        st.error(str(exc))
 
 
 def _render_event_log() -> None:
     st.subheader("Event Log")
     log = st.session_state.event_log or ["(empty)"]
     st.code("\n\n".join(reversed(log)))
+
+
+def _render_power_reveal_panel() -> None:
+    st.subheader("Last Reveal")
+    reveals = st.session_state.power_reveal
+    if not reveals:
+        st.caption("No private reveal pinned yet.")
+        return
+
+    for reveal in reveals:
+        if reveal["kind"] == "penalty":
+            st.error(reveal["public"])
+            continue
+        if st.session_state.show_full_state or st.session_state.selected_viewer_id == reveal["actor_id"]:
+            st.success(reveal["private"])
+        else:
+            st.info(reveal["public"])
+
+
+def _format_pending_power_hint(engine: GameEngine) -> str | None:
+    pending = engine.state.pending_power_action
+    if pending is None:
+        return None
+
+    actor_name = player_name(engine.state.players, pending.actor_id)
+
+    if pending.power_name == PowerType.SEE_SELF and pending.target_card_index is not None:
+        return (
+            f"Pending power: {actor_name} claimed `see_self` for own card index "
+            f"{pending.target_card_index}. Use `ResolvePendingPower` to reveal it now. "
+            "After reveal, the same reaction window stays open so that knowledge can be used immediately."
+        )
+
+    if (
+        pending.power_name == PowerType.SEE_OTHER
+        and pending.target_player_id is not None
+        and pending.target_card_index is not None
+    ):
+        return (
+            f"Pending power: {actor_name} claimed `see_other` for "
+            f"{player_name(engine.state.players, pending.target_player_id)}[{pending.target_card_index}]. "
+            "Use `ResolvePendingPower` to reveal it now. After reveal, the same reaction window stays open so that "
+            "knowledge can be used immediately."
+        )
+
+    if (
+        pending.power_name == PowerType.SEE_AND_SWAP
+        and pending.target_player_id is not None
+        and pending.target_card_index is not None
+        and pending.second_target_player_id is not None
+        and pending.second_target_card_index is not None
+    ):
+        return (
+            f"Pending power: {actor_name} claimed `see_and_swap` for "
+            f"{player_name(engine.state.players, pending.target_player_id)}[{pending.target_card_index}] and "
+            f"{player_name(engine.state.players, pending.second_target_player_id)}"
+            f"[{pending.second_target_card_index}]. Use `ResolvePendingPower` to reveal them now. "
+            "After reveal, the same reaction window stays open until someone resolves or closes it."
+        )
+
+    if pending.power_name == PowerType.BLIND_SWAP:
+        return (
+            f"Pending power: {actor_name} claimed `blind_swap`. "
+            "Use `ResolvePendingPower` to apply the swap. The reaction window stays open until a later action ends it."
+        )
+
+    return (
+        f"Pending power: {actor_name} claimed `{pending.power_name.value}`. "
+        "Use `ResolvePendingPower` to apply it now. The discard window remains open afterward unless another action closes it."
+    )
+
+
+def _describe_pending_resolution(engine: GameEngine) -> str:
+    pending = engine.state.pending_power_action
+    if pending is None:
+        return "No pending power."
+
+    actor_name = player_name(engine.state.players, pending.actor_id)
+    if pending.power_name == PowerType.SEE_SELF and pending.target_card_index is not None:
+        return f"{actor_name}: reveal own card at index {pending.target_card_index} now"
+    if (
+        pending.power_name == PowerType.SEE_OTHER
+        and pending.target_player_id is not None
+        and pending.target_card_index is not None
+    ):
+        return (
+            f"{actor_name}: reveal {player_name(engine.state.players, pending.target_player_id)}"
+            f"[{pending.target_card_index}] now"
+        )
+    if (
+        pending.power_name == PowerType.SEE_AND_SWAP
+        and pending.target_player_id is not None
+        and pending.target_card_index is not None
+        and pending.second_target_player_id is not None
+        and pending.second_target_card_index is not None
+    ):
+        return (
+            f"{actor_name}: reveal "
+            f"{player_name(engine.state.players, pending.target_player_id)}[{pending.target_card_index}] and "
+            f"{player_name(engine.state.players, pending.second_target_player_id)}"
+            f"[{pending.second_target_card_index}] now"
+        )
+    if pending.power_name == PowerType.BLIND_SWAP:
+        return f"{actor_name}: apply blind swap now"
+    return f"{actor_name}: resolve `{pending.power_name.value}` now"
 
 
 def _snapshot_pending_power_reveal(engine: GameEngine, pending: UsePower | None) -> list[tuple[int, int, str]]:
@@ -502,29 +1079,52 @@ def _format_power_reveal(
     engine: GameEngine,
     pending: UsePower | None,
     reveal_snapshot: list[tuple[int, int, str]],
-) -> list[str]:
+) -> list[dict[str, object]]:
     if pending is None or not reveal_snapshot:
         return []
 
     actor_name = player_name(engine.state.players, pending.actor_id)
     if pending.power_name == PowerType.SEE_SELF:
         _, card_index, card_label = reveal_snapshot[0]
-        return [f"{actor_name} saw own card at index {card_index}: {card_label}"]
+        return [
+            {
+                "kind": "power",
+                "actor_id": pending.actor_id,
+                "public": f"{actor_name} saw own card at index {card_index}",
+                "private": f"{actor_name} saw own card at index {card_index}: {card_label}",
+            }
+        ]
 
     if pending.power_name == PowerType.SEE_OTHER:
         target_player_id, card_index, card_label = reveal_snapshot[0]
         target_name = player_name(engine.state.players, target_player_id)
-        return [f"{actor_name} saw {target_name}[{card_index}]: {card_label}"]
+        return [
+            {
+                "kind": "power",
+                "actor_id": pending.actor_id,
+                "public": f"{actor_name} saw {target_name}[{card_index}]",
+                "private": f"{actor_name} saw {target_name}[{card_index}]: {card_label}",
+            }
+        ]
 
     if pending.power_name == PowerType.SEE_AND_SWAP:
         first_pid, first_index, first_card = reveal_snapshot[0]
         second_pid, second_index, second_card = reveal_snapshot[1]
         return [
-            (
-                f"{actor_name} saw "
-                f"{player_name(engine.state.players, first_pid)}[{first_index}]={first_card} and "
-                f"{player_name(engine.state.players, second_pid)}[{second_index}]={second_card}"
-            )
+            {
+                "kind": "power",
+                "actor_id": pending.actor_id,
+                "public": (
+                    f"{actor_name} saw "
+                    f"{player_name(engine.state.players, first_pid)}[{first_index}] and "
+                    f"{player_name(engine.state.players, second_pid)}[{second_index}]"
+                ),
+                "private": (
+                    f"{actor_name} saw "
+                    f"{player_name(engine.state.players, first_pid)}[{first_index}]={first_card} and "
+                    f"{player_name(engine.state.players, second_pid)}[{second_index}]={second_card}"
+                ),
+            }
         ]
 
     return []
@@ -587,28 +1187,27 @@ def _inject_styles() -> None:
         """
         <style>
         :root {
-            --paper: #f5efdf;
-            --ink: #1d1f1c;
             --accent: #a93f2b;
-            --accent-soft: #ead0c7;
-            --panel: #fffaf0;
-            --line: #d8c8ae;
-            --muted: #6f695e;
-            --deep: #26342b;
+            --accent-soft: rgba(169, 63, 43, 0.14);
+            --panel: var(--secondary-background-color);
+            --line: rgba(127, 127, 127, 0.24);
+            --muted: rgba(128, 128, 128, 0.92);
+            --deep: var(--text-color);
         }
         .stApp {
             background:
-                radial-gradient(circle at top left, rgba(169, 63, 43, 0.08), transparent 28%),
-                linear-gradient(180deg, #fcf7ea 0%, #f2ead5 100%);
-            color: var(--ink);
+                radial-gradient(circle at top left, rgba(169, 63, 43, 0.10), transparent 24%),
+                radial-gradient(circle at bottom right, rgba(38, 52, 43, 0.08), transparent 18%);
         }
         .hero-shell, .page-head {
-            background: linear-gradient(135deg, rgba(255,250,240,0.92), rgba(247,238,220,0.9));
+            background:
+                linear-gradient(135deg, rgba(169, 63, 43, 0.08), transparent 40%),
+                var(--panel);
             border: 1px solid var(--line);
             border-radius: 20px;
             padding: 1.25rem 1.4rem;
             margin-bottom: 1rem;
-            box-shadow: 0 10px 24px rgba(49, 42, 31, 0.08);
+            box-shadow: 0 10px 24px rgba(0, 0, 0, 0.08);
         }
         .page-head {
             display: flex;
@@ -632,7 +1231,8 @@ def _inject_styles() -> None:
         }
         .hero-shell p, .page-note {
             margin: 0.45rem 0 0;
-            color: var(--muted);
+            color: var(--text-color);
+            opacity: 0.82;
             max-width: 58rem;
         }
         .player-shell {
@@ -640,7 +1240,7 @@ def _inject_styles() -> None:
             border: 1px solid var(--line);
             border-radius: 16px;
             padding: 0.9rem 1rem 0.7rem;
-            box-shadow: 0 8px 18px rgba(54, 46, 35, 0.05);
+            box-shadow: 0 8px 18px rgba(0, 0, 0, 0.05);
         }
         .player-head {
             display: flex;
@@ -653,7 +1253,8 @@ def _inject_styles() -> None:
             color: var(--deep);
         }
         .player-meta {
-            color: var(--muted);
+            color: var(--text-color);
+            opacity: 0.76;
             font-size: 0.9rem;
             margin-top: 0.35rem;
         }
@@ -673,8 +1274,14 @@ def _inject_styles() -> None:
             text-transform: uppercase;
             letter-spacing: 0.04em;
         }
-        code {
-            color: var(--deep);
+        .stCodeBlock, div[data-testid="stCodeBlock"] {
+            border-radius: 14px;
+            overflow: hidden;
+        }
+        @media (prefers-contrast: more) {
+            .player-badge {
+                border: 1px solid currentColor;
+            }
         }
         </style>
         """,

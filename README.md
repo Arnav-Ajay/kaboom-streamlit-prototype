@@ -12,6 +12,8 @@ The earlier prototype-only rules, Firebase helpers, and room-store implementatio
 
 Current implemented scope:
 - local single-browser engine inspector
+- local 2-player human-vs-agent mode
+- local JSON event-log persistence under `backend/event_logs/`
 - player-perspective rendering using engine memory
 - opening peek flow
 - turn, reaction, and pending-power action execution from `get_valid_actions(state)`
@@ -80,6 +82,8 @@ This order matters because the current CLI is already being used to find engine 
 The first production-quality Streamlit version should support:
 - room creation and joining
 - opening peek flow
+- local human-vs-agent play
+- persistent event logs and replay-friendly state traces
 - draw, replace, discard, discard-for-power, and reaction windows
 - pending power and contested discard visualization
 - Kaboom declaration and endgame visibility
@@ -124,9 +128,10 @@ pip install -e ../kaboom-core
 
 ## Immediate Next Step
 
-Milestone 1 is in place as a local engine inspector.
+Milestone 1 is in place as a local engine inspector with a first-pass human-vs-agent mode.
 
 The next step is Milestone 2:
 - tighten perspective-safe rendering
 - improve the in-browser debugging surface
+- refine agent behavior and reaction UX
 - prepare the app structure for room-based multiplayer without reintroducing app-side rules
